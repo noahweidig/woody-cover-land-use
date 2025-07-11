@@ -1,0 +1,469 @@
+---
+title: "Changes in woody cover in regions experiencing changes from non-woody to forest NLCD types in the eastern United States"
+author: |
+  Michaella A. Ivey\textsuperscript{1}, Noah C. Weidig\textsuperscript{1}, Alan Ivory\textsuperscript{1}, Noah J. Carl\textsuperscript{1}, Victoria M. Donovan\textsuperscript{1}
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output: pdf_document
+header-includes:
+  - \usepackage{pdflscape}
+  - \newcommand{\blandscape}{\begin{landscape}}
+  - \newcommand{\elandscape}{\end{landscape}}
+---
+
+\textsuperscript{1}University of Florida, School of Forest, Fisheries, and Geomatics Sciences, West Florida Research and Education Center, Institute of Food and Agricultural Sciences, University of Florida, Milton, FL, USA
+
+\newpage
+\blandscape
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = FALSE,
+	message = FALSE,
+	warning = FALSE
+)
+pacman::p_load(tidyverse, skimr, flextable, trend, sf, cowplot, colorspace, data.table, officer, snakecase)
+set_flextable_defaults(font.family = "Times New Roman", line.spacing = 1)
+
+land_cover_class_01 <-
+  tribble(~class_01, ~class_name_01,
+          41, "Deciduous Forest",
+          42, "Evergreen Forest",
+          43, "Mixed Forest",
+          52, "Shrub Scrub",
+          71, "Grassland Herbaceous",
+          81, "Pasture Hay",
+          82, "Cultivated Crops",
+          90, "Woody Wetlands",
+          95, "Emergent Herbaceous Wetlands")
+
+land_cover_class_21 <- land_cover_class_01 %>%
+  rename_with(~ gsub("01", "21", .x))
+
+ecoregion_names <- fread("data/us_l3code_to_ecoregion_name.csv")
+```
+
+```{r import_data_ch}
+area_ch <- fread("data/nwood_transitional/nlcd_area_nwood_transitional.csv")
+file_path_ch <- "data/nwood_transitional/"
+file_names_ch <- paste0("nlcd_rap_nwood_transitional_", 2001:2021, ".csv")
+
+all_data_ch <- file_names_ch %>%
+  map_dfr(~ fread(file.path(file_path_ch, .))) %>%
+  rename(poly_id = index)
+
+merged_ch <- all_data_ch %>%
+  left_join(area_ch, by = c("us_l3code", "poly_id", "combined_code")) |>
+  mutate(area_wc = (mean * area_ha)) |>
+  group_by(combined_code, us_l3code, year) |>
+  summarise(area_wc = sum(area_wc),
+            area_ha = sum(area_ha), .groups = "drop") |>
+  mutate(class_01 = as.numeric(str_sub(combined_code, 1, 2)),
+         class_21 = as.numeric(str_sub(combined_code, -2))) |>
+  ungroup() |>
+  left_join(land_cover_class_01, by = "class_01") |>
+  left_join(land_cover_class_21, by = "class_21") |>
+  left_join(ecoregion_names, by = "us_l3code") |>
+  dplyr::select(-c(combined_code, us_l3code, class_01, class_21)) %>%
+  mutate(change_class = str_c(class_name_01, class_name_21, sep = " to "))
+```
+
+```{r sens_slope}
+sen_data_ch <- merged_ch %>%
+  group_by(change_class, year) %>%
+  summarise(area_wc = as.numeric(sum(area_wc)),
+            area_ha = as.numeric(sum(area_ha)),
+            .groups = "drop") %>%
+  mutate(perc_wc = (area_wc / area_ha) * 100) %>%
+  dplyr::select(change_class, year, perc_wc, area_wc) %>%
+  arrange(year)
+
+sens_results_ch <- sen_data_ch %>%
+  group_by(change_class) %>%
+  summarise(perc_wc_slope = sens.slope(perc_wc)$estimates,
+            perc_wc_p_value = sens.slope(perc_wc)$p.value,
+            area_wc_slope = sens.slope(area_wc)$estimates,
+            area_wc_p_value = sens.slope(area_wc)$p.value) %>%
+  mutate(across(where(is.numeric), ~ round(., 3)),
+         mutate(across(matches("p_value$"),
+                       ~ ifelse(. < 0.001, "<0.001", .))))
+
+# Summarize for both years in one step
+lc_change_ch <- merged_ch %>%
+  filter(year %in% c(2001, 2021)) %>%
+  group_by(change_class, year) %>%
+  summarise(area_wc = sum(area_wc),
+            area_ha = sum(area_ha),
+            .groups = 'drop') %>%
+  mutate(perc_wc = (area_wc / area_ha) * 100) %>%
+  pivot_wider(names_from = year,
+              values_from = c(area_wc, area_ha, perc_wc)) %>%
+  mutate(area_change = (area_wc_2021 - area_wc_2001),
+         perc_change = (perc_wc_2021 - perc_wc_2001),
+         perc_area_change = (area_change / area_wc_2001) * 100) %>%
+  left_join(sens_results_ch, by = "change_class") %>%
+  dplyr::select(change_class, area_ha_2021, area_wc_2001, perc_wc_2001,
+         area_wc_2021, perc_wc_2021, area_change, perc_area_change,
+         perc_wc_slope, perc_wc_p_value) %>%
+  mutate(across(where(is.numeric),
+                ~ case_when(. >= 100 ~ round(., 0),
+                            . < 100 & . > 1 ~ round(., 1),
+                            . <= 1 & . >= -1 ~ round(., 3),
+                            TRUE ~ round(., 0)))) %>%
+  write_csv("outputs/data/transitional_change_ft_l1.csv")
+```
+
+\newpage
+
+```{r l3_eco}
+pacman::p_load(tidyverse, purrr, sf, scales, cowplot, patchwork, grid)
+
+# sen-slope and p-value for each group
+sen_data_l3 <- merged_ch %>%
+  group_by(year, us_l3name) %>%
+  summarise(area_wc = as.numeric(sum(area_wc)),
+            area_ha = as.numeric(sum(area_ha)), .groups = "drop") %>%
+  mutate(perc_wc = (area_wc / area_ha) * 100) %>%
+  dplyr::select(us_l3name, year, perc_wc, area_wc) %>%
+  arrange(year)
+
+# Calculate Sen's slope and p-value for both `perc_wc` and `area_wc`
+sens_results_l3 <- sen_data_l3 %>%
+  group_by(us_l3name) %>%
+  summarise(perc_wc_slope = sens.slope(perc_wc)$estimates,
+            perc_wc_p_value = sens.slope(perc_wc)$p.value,
+            area_wc_slope = sens.slope(area_wc)$estimates,
+            area_wc_p_value = sens.slope(area_wc)$p.value,
+            .groups = "drop") %>%
+  mutate(across(where(is.numeric), ~ round(., 3)))
+
+# Summarize for both years in one step
+lc_change_l3 <- merged_ch %>%
+  filter(year %in% c(2001, 2021)) %>%
+  group_by(year, us_l3name) %>%
+  summarise(area_wc = sum(area_wc),
+            area_ha = sum(area_ha), .groups = 'drop') %>%
+  mutate(perc_wc = (area_wc / area_ha) * 100) %>%
+  pivot_wider(names_from = year,
+              values_from = c(area_wc, area_ha, perc_wc)) %>%
+  mutate(area_change = (area_wc_2021 - area_wc_2001),
+         perc_change = (perc_wc_2021 - perc_wc_2001),
+         perc_area_change = (area_change / area_wc_2001) * 100) %>%
+  left_join(sens_results_l3, by = "us_l3name") %>%
+  dplyr::select(us_l3name, area_ha_2021, area_wc_2001, perc_wc_2001,
+         area_wc_2021, perc_wc_2021, area_change, perc_area_change,
+         area_wc_slope, area_wc_p_value, perc_change, perc_wc_slope,
+         perc_wc_p_value) %>%
+  mutate(across(where(is.numeric),
+                ~ case_when(. >= 100 ~ round(., 0),
+                            . < 100 & . > 1 ~ round(., 1),
+                            . <= 1 & . >= -1 ~ round(., 3),
+                            TRUE ~ round(., 0))))
+
+# Load ecoregion data and prepare it
+l3_eco_shp <- st_read("~/OneDrive - University of Florida/thesis/data/us_eco_l3/us_eco_l3.shp", quiet = TRUE) %>%
+  filter(NA_L1CODE == 8) %>%
+  dplyr::select(us_l3name = NA_L3NAME) %>%
+  group_by(us_l3name) %>%
+  summarise()
+
+# Merge change data with eco-region data and classify significance
+lc_change_l3_shp <- lc_change_l3 %>%
+  merge(l3_eco_shp, by = "us_l3name") %>%
+  mutate(sig = ifelse(perc_wc_p_value > 0.05, "non_sig", "sig"))
+
+range(lc_change_l3_shp$area_wc_slope)
+
+perc_plot <- 
+  lc_change_l3_shp %>%
+  ggplot() +
+  geom_sf(aes(geometry = geometry,
+              fill = ifelse(sig == "non_sig", NA, perc_wc_slope),
+              color = "")) +
+  scale_fill_steps2(low = "#8E00A4",
+                    mid = "white",
+                    high = "#136600",
+                    midpoint = 0, #limits = c(0, 1.5),
+                    na.value = "grey",
+                    name = "Sen's Slope\n(%/year)",
+                    n.breaks = 6) +
+  scale_color_manual(values  = NA, labels = "n.s.") +
+  guides(fill  = guide_colorsteps(order = 1, even.steps = TRUE),
+         color = guide_legend("", override.aes = list(color = "grey", fill = "grey"),
+                              order = 2)) +
+  theme_minimal() +
+  theme(axis.text = element_blank(),
+        panel.grid = element_blank())
+
+# Save the combined plot
+ragg::agg_png(filename = "outputs/objective_2/transitional_perc_l1_fig.png", scaling = 0.9,
+              height = 3, width = 5, units = "in", res = 600)
+print(perc_plot)
+invisible(dev.off())
+
+area_plot <- 
+  lc_change_l3_shp %>%
+  ggplot() +
+  geom_sf(aes(geometry = geometry,
+              fill = ifelse(sig == "non_sig", NA, area_wc_slope),
+              color = "")) +
+  scale_fill_steps2(low = "#8E00A4",
+                    mid = "white",
+                    high = "#136600",
+                    midpoint = 0,
+                    #limits = c(0, 50000),
+                    na.value = "grey",
+                    name = "Sen's Slope\n(ha/year)",
+                    n.breaks = 8, nice.breaks = TRUE) +
+  scale_color_manual(values  = NA, labels = "n.s.") +
+  guides(fill  = guide_colorsteps(order = 1, even.steps = TRUE),
+         color = guide_legend("", override.aes = list(color = "grey", fill = "grey"),
+                              order = 2)) +
+  theme_minimal() +
+  theme(axis.text = element_blank(),
+        panel.grid = element_blank())
+
+# Save the combined plot
+ragg::agg_png(filename = "outputs/objective_2/transitional_area_l1_fig.png", scaling = 0.9,
+              height = 3, width = 5, units = "in", res = 600)
+print(area_plot)
+invisible(dev.off())
+```
+
+```{r eco_l3_by_class}
+pacman::p_load(tidyverse, purrr, sf, scales, cowplot, patchwork, grid)
+
+sen_data_l3 <- merged_ch %>%
+  group_by(change_class, year, us_l3name) %>%
+  summarise(area_wc = as.numeric(sum(area_wc)),
+            area_ha = as.numeric(sum(area_ha)), .groups = "drop") %>%
+  write_csv(., "outputs/nwood_transitional_change_data_all.csv") %>%
+
+  mutate(perc_wc = (area_wc / area_ha) * 100) %>%
+  dplyr::select(us_l3name, change_class, year, perc_wc, area_wc) %>%
+  arrange(year)
+
+# Calculate Sen's slope and p-value for both `perc_wc` and `area_wc`
+sens_results_l3 <- sen_data_l3 %>%
+  group_by(change_class, us_l3name) %>%
+  summarise(perc_wc_slope = sens.slope(perc_wc)$estimates,
+            perc_wc_p_value = sens.slope(perc_wc)$p.value,
+            area_wc_slope = sens.slope(area_wc)$estimates,
+            area_wc_p_value = sens.slope(area_wc)$p.value,
+            .groups = "drop") %>%
+  mutate(across(where(is.numeric), ~ round(., 3)))
+
+# Summarize for both years in one step
+lc_change_l3 <- merged_ch %>%
+  filter(year %in% c(2001, 2021)) %>%
+  group_by(change_class, year, us_l3name) %>%
+  summarise(area_wc = sum(area_wc),
+            area_ha = sum(area_ha), .groups = 'drop') %>%
+  mutate(perc_wc = (area_wc / area_ha) * 100) %>%
+  pivot_wider(names_from = year,
+              values_from = c(area_wc, area_ha, perc_wc)) %>%
+  mutate(area_change = (area_wc_2021 - area_wc_2001),
+         perc_change = (perc_wc_2021 - perc_wc_2001),
+         perc_area_change = (area_change / area_wc_2001) * 100) %>%
+  left_join(sens_results_l3, by = c("change_class", "us_l3name")) %>%
+  dplyr::select(us_l3name, change_class, area_ha_2021, area_wc_2001, perc_wc_2001,
+         area_wc_2021, perc_wc_2021, area_change, perc_area_change,
+         area_wc_slope, area_wc_p_value, perc_change, perc_wc_slope,
+         perc_wc_p_value) %>%
+  mutate(across(where(is.numeric),
+                ~ case_when(. >= 100 ~ round(., 0),
+                            . < 100 & . > 1 ~ round(., 1),
+                            . <= 1 & . >= -1 ~ round(., 3),
+                            TRUE ~ round(., 0))))
+
+# Load ecoregion data and prepare it
+l3_eco_shp <- st_read("~/OneDrive - University of Florida/thesis/data/us_eco_l3/us_eco_l3.shp", quiet = TRUE) %>%
+  filter(NA_L1CODE == 8) %>%
+  dplyr::select(us_l3name = NA_L3NAME) %>%
+  group_by(us_l3name) %>%
+  summarise()
+
+# Merge change data with eco-region data and classify significance
+lc_change_l3_shp <- lc_change_l3 %>%
+  merge(l3_eco_shp, by = "us_l3name") %>%
+  mutate(sig = ifelse(perc_wc_p_value > 0.05, "non_sig", "sig"))
+
+perc_plot <- 
+  lc_change_l3_shp %>%
+  mutate(class_01 = str_extract(change_class, "^\\w+ \\w+"),
+         class_21 = str_extract(change_class, "\\w+ \\w+$")) %>%
+  ggplot() +
+  geom_sf(aes(geometry = geometry,
+              fill = ifelse(sig == "non_sig", NA, perc_wc_slope),
+              color = "")) +
+  scale_fill_steps2(low = "#8E00A4",
+                    mid = "white",
+                    high = "#136600",
+                    midpoint = 0,
+                    #limits = c(-2.5, 2.5),
+                    na.value = "grey",
+                    name = "Sen's Slope\n(%/year)",
+                    n.breaks = 8, nice.breaks = TRUE, show.limits = F) +
+  theme_minimal() +
+  theme(axis.text = element_blank(),
+        panel.grid = element_blank(),
+        legend.position = "bottom",
+        strip.text = element_text(size = 12),
+        plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+        axis.title.y = element_text(size = 14, face = "bold")) +
+  facet_grid(rows = vars(class_01), cols = vars(class_21), switch = "y") +
+  scale_color_manual(values  = NA, labels = "n.s.") +
+  guides(fill  = guide_colorsteps(order = 1,
+                                  even.steps = TRUE,
+                                  keywidth = unit(6, "cm")),
+         color = guide_legend("", override.aes = list(color = "grey", fill = "grey"),
+                              order = 2)) +
+  ggtitle("Cover Class in 2021") +
+  labs(y = "Cover Class 2001")
+
+# Save the combined plot
+ragg::agg_png(filename = "outputs/objective_2/transitional_perc_l3_fig.png", scaling = 0.9,
+              height = 12, width = 7, units = "in", res = 600)
+print(perc_plot)
+invisible(dev.off())
+
+area_plot <- 
+  lc_change_l3_shp %>%
+  mutate(class_01 = str_extract(change_class, "^\\w+ \\w+"),
+         class_21 = str_extract(change_class, "\\w+ \\w+$")) %>%
+  ggplot() +
+  geom_sf(aes(geometry = geometry,
+              fill = ifelse(sig == "non_sig", NA, area_wc_slope),
+          color = "")) +
+  theme_minimal() +
+  scale_fill_steps2(low = "#8E00A4",
+                    mid = "white",
+                    high = "#136600",
+                    midpoint = 0,
+                    #limits = c(-5000,25000),
+                    na.value = "grey",
+                    name = "Sen's Slope\n(ha/year)",
+                    n.breaks = 8, nice.breaks = TRUE, show.limits = F) +
+  scale_color_manual(values  = NA, labels = "n.s.") +
+  guides(fill  = guide_colorsteps(order = 1,
+                                  even.steps = TRUE,
+                                  keywidth = unit(6, "cm"),
+                                  label.hjust = 1, label.vjust = 1.1,
+                                  label.theme = element_text(angle = 45)),
+         color = guide_legend("", override.aes = list(color = "grey", fill = "grey"),
+                              order = 2)) +
+  theme(axis.text = element_blank(),
+        panel.grid = element_blank(),
+        legend.position = "bottom",
+        strip.text = element_text(size = 12),
+        plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+        axis.title.y = element_text(size = 14, face = "bold")) +
+  facet_grid(rows = vars(class_01), cols = vars(class_21), switch = "y") +
+  ggtitle("Cover Class in 2021") +
+  labs(y = "Cover Class 2001")
+
+# Save the combined plot
+ragg::agg_png(filename = "outputs/objective_2/transitional_area_l3_fig.png", scaling = 0.9,
+              height = 12, width = 7, units = "in", res = 600)
+print(area_plot)
+invisible(dev.off())
+```
+
+```{r l3_table}
+ft_l3 <- lc_change_l3 %>%
+  dplyr::select(-c(perc_change, area_wc_slope, area_wc_p_value)) %>%
+  mutate(us_l3name = str_replace(us_l3name,
+                                 "Southern Michigan/Northern Indiana Drift Plains",
+                                 "S MI/N IN Drift Plains"),
+         us_l3name = str_replace(us_l3name,
+                                 "Southeastern Wisconsin Till Plains",
+                                 "SE Wisconsin Till Plains")) %>%
+  mutate(across(matches(c("area_ha", "area_wc", "area_change")) &
+                  !matches(c("area_wc_p_value", "perc_area_change")),
+                ~ round(., 0))) %>%
+  mutate(perc_area_change = round(perc_area_change, 1)) %>%
+  mutate(across(where(is.numeric), ~ round(., 3))) %>%
+  mutate(across(matches("p_value$"), ~ ifelse(. < 0.001, "<0.001", .))) %>%
+  arrange(us_l3name) %>%
+  write_csv("outputs/nwood_transitional_change_data.csv") %>%
+  write_csv("outputs/data/transitional_change_ft_l3.csv")
+```
+
+```{r line_graphs}
+# Area over time
+plots <- merged_ch %>%
+  left_join(sens_results_l3, by = c("us_l3name", "change_class")) %>%
+  mutate(across(contains("p_value"), ~ ifelse(. < 0.001, "<0.001", as.character(.)))) %>%
+  mutate(label = paste("Sens Slope:", round(area_wc_slope, 2),
+                        "\nP-value:", area_wc_p_value)) %>%
+  arrange(us_l3name) %>%
+  group_by(us_l3name) %>%
+  group_split() %>%
+  set_names(map(., ~ unique(.x$us_l3name))) %>%
+  map(~ ggplot(.x, aes(x = year, y = area_wc)) +
+        geom_line() +
+        geom_smooth(se = TRUE, method = "loess", formula = 'y ~ x') +
+        geom_text(data = .x %>% group_by(change_class) %>% 
+                    summarize(x_pos = min(year), 
+                              y_pos = max(area_wc), 
+                              label = first(label), 
+                              .groups = "drop"), 
+                  aes(x = x_pos, y = y_pos, label = label), 
+                  inherit.aes = FALSE, 
+                  hjust = 0, vjust = 1, size = 3) +
+        facet_wrap(~ change_class, scales = "free") +
+        labs(x = "Year",
+             y = "Area of woody cover (ha)",
+             title = unique(.x$us_l3name)) +
+        theme_minimal() +
+        theme(legend.position = "bottom"))
+
+plots %>%
+  imap(~ ggsave(filename = paste0(str_replace_all(to_snake_case(.y), "[ /]", "_"), "_area_change.jpg"),
+                plot = .x,
+                device = "jpeg",
+                path = "outputs/objective_2/transitional_linegraphs",
+                width = 10, height = 6, dpi = 300))
+
+# Percentage over time
+plots_perc <- merged_ch %>%
+  group_by(us_l3name, change_class, year) %>%
+  summarize(area_wc = sum(area_wc), 
+            area_ha = sum(area_ha), .groups = "drop") %>%
+  mutate(perc_wc = area_wc / area_ha,
+         change_class = factor(change_class)) %>%
+  left_join(sens_results_l3, by = c("us_l3name", "change_class")) %>%
+  mutate(across(contains("p_value"), ~ ifelse(. < 0.001, "<0.001", as.character(.)))) %>%
+  mutate(label = paste("Sens Slope:", round(perc_wc_slope, 2),
+                        "\nP-value:", perc_wc_p_value)) %>%
+  arrange(us_l3name) %>%
+  ungroup() %>%
+  group_by(us_l3name) %>%
+  group_split() %>%
+  set_names(map(., ~ unique(.x$us_l3name))) %>%
+  map(~ ggplot(.x, aes(x = year, y = perc_wc)) +
+        geom_line() +
+        geom_smooth(se = TRUE, method = "loess", formula = 'y ~ x') +
+        geom_text(data = .x %>% group_by(change_class) %>% 
+                    summarize(x_pos = min(year), 
+                              y_pos = max(perc_wc), 
+                              label = first(label), 
+                              .groups = "drop"), 
+                  aes(x = x_pos, y = y_pos, label = label), 
+                  inherit.aes = FALSE, hjust = 0, vjust = 1, size = 3) +
+        facet_wrap(~ change_class, scales = "free") +
+        labs(x = "Year",
+             y = "Percent woody cover (%)",
+             title = unique(.x$us_l3name)) +
+        theme_minimal() +
+        theme(legend.position = "bottom") +
+        scale_y_continuous(labels = scales::percent_format()))
+
+plots_perc %>%
+  imap(~ ggsave(filename = paste0(str_replace_all(to_snake_case(.y), "[ /]", "_"), "_perc_change.jpg"),
+                plot = .x,
+                device = "jpeg",
+                path = "outputs/objective_2/transitional_linegraphs",
+                width = 10, height = 6, dpi = 300))
+```
+
+\elandscape
