@@ -10,11 +10,6 @@ Michaella A. Ivey<sup>1</sup>, Noah C. Weidig<sup>1</sup>, Alan A. Ivory II<sup>
 
 **Corresponding Author's email**: iveym\@ufl.edu
 
-
-**Journal**: TBD
-
-**Plain Language Summary**:
-
 ## Repository Structure
 ```
 woody-cover-land-use/
